@@ -11,7 +11,7 @@ trap cleanup EXIT
 cd "$T"
 
 fail() { echo "FAIL $*" >&2; podman ps -a >&2 || true; exit 1; }
-get()  { local i; for i in $(seq 1 20); do curl -fsS "$1" 2>/dev/null && return 0; sleep 0.5; done; return 1; }
+get()  { local _; for _ in $(seq 1 20); do curl -fsS "$1" 2>/dev/null && return 0; sleep 0.5; done; return 1; }
 
 "$SITES" new itest >/dev/null
 cd itest

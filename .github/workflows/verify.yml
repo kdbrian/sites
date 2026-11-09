@@ -14,7 +14,7 @@ jobs:
     name: shellcheck + syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: bash -n
         run: for f in sites tests/*.sh; do bash -n "$f"; done
       - name: shellcheck
@@ -24,7 +24,7 @@ jobs:
     name: smoke tests (no containers)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: tests/smoke.sh
 
   integration:
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, smoke]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: install podman-compose
         run: |
           podman --version
