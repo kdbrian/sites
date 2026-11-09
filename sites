@@ -146,6 +146,16 @@ is_running() { # is_running <container>
   [[ "$(podman container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]
 }
 
+# rm_container <name> — remove a container, tolerating Podman's rootless-netns cleanup
+# error ("kill network process: permission denied", seen on Ubuntu with AppArmor),
+# which is reported even though the container is removed. Fails only if it's still there.
+rm_container() {
+  podman rm -f --ignore "$1" >/dev/null 2>&1 || true
+  if podman container exists "$1" 2>/dev/null; then
+    die "could not remove container $1 (try: podman rm -f $1)"
+  fi
+}
+
 local_url() {
   local bind; bind="$(env_get BIND)"
   [[ -z "$bind" || "$bind" == "0.0.0.0" ]] && bind="localhost"
@@ -247,6 +257,10 @@ cmd_stop() {
   fi
   resolve_project "${1:-}"
   pc --profile tunnel down >/dev/null 2>&1 || true
+  # compose may stop early on Podman's netns cleanup error; finish the job
+  rm_container "site-$P_NAME-tunnel"
+  rm_container "site-$P_NAME-web"
+  podman network rm --force "site-${P_NAME}_default" >/dev/null 2>&1 || true
   ok "$P_NAME stopped"
 }
 
@@ -278,7 +292,7 @@ cmd_tunnel() {
 
 cmd_untunnel() {
   resolve_project "${1:-}"
-  podman rm -f --ignore "site-$P_NAME-tunnel" >/dev/null
+  rm_container "site-$P_NAME-tunnel"
   ok "tunnel closed for $P_NAME (site still running locally)"
 }
 
@@ -383,7 +397,7 @@ write_mounts_compose() {
 apply_mounts() {
   if is_running "site-$P_NAME-web"; then
     info "applying: recreating $P_NAME web container…"
-    podman rm -f --ignore "site-$P_NAME-web" >/dev/null
+    rm_container "site-$P_NAME-web"
     pc up -d web >/dev/null
     is_running "site-$P_NAME-web" || die "web container did not start (try: sites logs $P_NAME)"
     ok "applied"

@@ -40,3 +40,6 @@ Set `BIND=0.0.0.0` in `.env`, run `sites restart <name>`, and allow the port thr
 sites stop --all
 podman image rm docker.io/library/nginx:alpine docker.io/cloudflare/cloudflared:latest
 ```
+
+### `rootless netns: kill network process: permission denied`
+On Ubuntu with AppArmor (`kernel.apparmor_restrict_unprivileged_userns = 1`), rootless Podman can print this when it removes a container. The container **is** still removed, so `sites` ignores the error and checks that the container is really gone. You only get an error if it's still there. If you see it from plain `podman rm`, you can ignore it as well.
