@@ -1,0 +1,22 @@
+# Project compose file, created by `sites new`.
+# Values come from .env next to this file (NAME, PORT, BIND).
+services:
+  web:
+    image: docker.io/library/nginx:alpine
+    container_name: site-${NAME}-web
+    ports:
+      - "${BIND:-127.0.0.1}:${PORT:-8080}:80"
+    volumes:
+      - ./public:/usr/share/nginx/html:ro,Z
+    restart: "no"
+
+  # HTTPS tunnel (Cloudflare quick tunnel, no account needed).
+  # Only runs with the "tunnel" profile: `sites tunnel <name>`.
+  tunnel:
+    image: docker.io/cloudflare/cloudflared:latest
+    container_name: site-${NAME}-tunnel
+    command: tunnel --no-autoupdate --url http://web:80
+    depends_on:
+      - web
+    profiles: ["tunnel"]
+    restart: "no"

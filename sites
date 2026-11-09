@@ -1,0 +1,750 @@
+#!/usr/bin/env bash
+# sites — create and run local static sites with Podman, with on-demand HTTPS tunnels.
+# See README.md and docs/ next to this script.
+set -euo pipefail
+
+VERSION="1.1.0"
+SITES_HOME="${SITES_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}"
+TEMPLATE_DIR="${SITES_TEMPLATE:-$SITES_HOME/_template}"
+REGISTRY="${SITES_REGISTRY:-${XDG_CONFIG_HOME:-$HOME/.config}/sites/projects}"
+BASE_PORT="${SITES_BASE_PORT:-8081}"
+TUNNEL_WAIT="${SITES_TUNNEL_WAIT:-30}"
+WEBROOT="/usr/share/nginx/html"        # nginx document root inside the container
+MOUNTS_FILE=".mounts"                  # per-project list of extra mounts (source of truth)
+MOUNTS_COMPOSE="compose.mounts.yaml"   # generated from .mounts, layered over compose.yaml
+
+# ---------- output helpers ----------
+if [[ -t 1 ]]; then
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YLW=$'\e[33m'; C_BLU=$'\e[34m'; C_DIM=$'\e[2m'; C_OFF=$'\e[0m'
+else
+  C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_DIM=""; C_OFF=""
+fi
+die()  { echo "${C_RED}error:${C_OFF} $*" >&2; exit 1; }
+warn() { echo "${C_YLW}warn:${C_OFF} $*" >&2; }
+info() { echo "${C_BLU}::${C_OFF} $*"; }
+ok()   { echo "${C_GRN}✓${C_OFF} $*"; }
+
+# ---------- compose provider ----------
+compose_bin() {
+  if command -v podman-compose >/dev/null 2>&1; then
+    echo "podman-compose"
+  elif command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
+    echo "podman compose"
+  else
+    die "podman-compose not found. Install it: sudo apt install podman-compose"
+  fi
+}
+
+# Run compose for the resolved project ($P_NAME / $P_DIR)
+pc() {
+  local bin; bin="$(compose_bin)"
+  local files=(-f compose.yaml)
+  [[ -f "$P_DIR/$MOUNTS_COMPOSE" ]] && files+=(-f "$MOUNTS_COMPOSE")
+  # shellcheck disable=SC2086  # $bin may be "podman compose"
+  (cd "$P_DIR" && $bin -p "site-$P_NAME" "${files[@]}" "$@")
+}
+
+# ---------- registry (name<TAB>path, one per line) ----------
+is_project_dir() { [[ -f "$1/compose.yaml" && -f "$1/.env" ]]; }
+
+reg_list() { # prints "name<TAB>path" for projects that still exist
+  [[ -f "$REGISTRY" ]] || return 0
+  local n p
+  while IFS=$'\t' read -r n p; do
+    [[ -n "$n" && -n "$p" ]] && is_project_dir "$p" && printf '%s\t%s\n' "$n" "$p"
+  done < "$REGISTRY"
+  return 0
+}
+
+reg_path() { reg_list | awk -F'\t' -v n="$1" '$1 == n { print $2; exit }'; }
+
+reg_add() { # reg_add <name> <path>  (also prunes entries whose folder is gone)
+  mkdir -p "$(dirname "$REGISTRY")"
+  local tmp; tmp="$(mktemp)"
+  reg_list | awk -F'\t' -v n="$1" -v p="$2" '$1 != n && $2 != p' > "$tmp"
+  printf '%s\t%s\n' "$1" "$2" >> "$tmp"
+  mv "$tmp" "$REGISTRY"
+}
+
+all_projects() { reg_list | cut -f1; }
+
+# ---------- project helpers ----------
+valid_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || die "invalid name '$1' (use lowercase letters, digits, dashes)"
+}
+
+slugify() { # folder name -> valid project name
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-41
+}
+
+env_get_dir() { # env_get_dir <dir> <KEY>
+  grep -E "^$2=" "$1/.env" 2>/dev/null | tail -n1 | cut -d= -f2-
+}
+env_get() { env_get_dir "$P_DIR" "$1"; }
+
+# find_project_up <dir> — walk up from <dir> to find an enclosing project folder.
+find_project_up() {
+  local d="$1"
+  while [[ "$d" != "/" ]]; do
+    is_project_dir "$d" && [[ -n "$(env_get_dir "$d" NAME)" ]] && { echo "$d"; return 0; }
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+# Does $1 look like a path rather than a name? (., .., ./x, ../x, ~/x, /x, a/b)
+looks_like_path() { [[ "$1" == "." || "$1" == ".." || "$1" == */* || "$1" == "~"* ]]; }
+
+# resolve_project [name|path] — sets P_NAME and P_DIR.
+#   (nothing)  the project folder you're in (searching upward)
+#   path       the project at/above that folder: ., ./blog, ../x, ~/sites/blog, /abs/path
+#   name       a registered project name (falls back to ./name if it's a project folder)
+resolve_project() {
+  local arg="${1:-}" start=""
+  if [[ -z "$arg" ]]; then
+    start="$PWD"
+  elif looks_like_path "$arg"; then
+    [[ "$arg" == "~"* ]] && arg="$HOME${arg:1}"
+    [[ -d "$arg" ]] || die "no such directory: $1"
+    start="$(realpath "$arg")"
+  else
+    P_DIR="$(reg_path "$arg")"
+    if [[ -n "$P_DIR" ]]; then P_NAME="$arg"; return 0; fi
+    [[ -d "$arg" ]] && is_project_dir "$arg" || die "no project named '$arg' (see: sites status)"
+    start="$(realpath "$arg")"
+  fi
+
+  P_DIR="$(find_project_up "$start")" || {
+    if [[ -z "$1" ]]; then die "not inside a project folder (give a name or path, or create one: sites new -y)"
+    else die "'$1' is not inside a project folder"; fi
+  }
+  P_NAME="$(env_get_dir "$P_DIR" NAME)"
+  valid_name "$P_NAME"
+  # keep the registry in sync if the folder was moved/copied
+  [[ "$(reg_path "$P_NAME")" == "$P_DIR" ]] || reg_add "$P_NAME" "$P_DIR"
+}
+
+# Is $1 a project name (not an option)?
+is_name_arg() { [[ -n "${1:-}" && "$1" != -* ]]; }
+
+port_taken() {
+  local p="$1" path
+  while IFS=$'\t' read -r _ path; do
+    [[ "$(env_get_dir "$path" PORT)" == "$p" ]] && return 0
+  done < <(reg_list)
+  ss -ltnH "sport = :$p" 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+next_port() {
+  local p="$BASE_PORT"
+  while port_taken "$p"; do p=$((p + 1)); done
+  echo "$p"
+}
+
+is_running() { # is_running <container>
+  [[ "$(podman container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]
+}
+
+local_url() {
+  local bind; bind="$(env_get BIND)"
+  [[ -z "$bind" || "$bind" == "0.0.0.0" ]] && bind="localhost"
+  echo "http://$bind:$(env_get PORT)"
+}
+
+tunnel_url() {
+  podman logs "site-$P_NAME-tunnel" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n1 || true
+}
+
+# ---------- commands ----------
+cmd_new() {
+  local arg="" port="" name="" yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes)  yes=1; shift ;;
+      -p|--port) port="${2:-}"; shift 2 ;;
+      -n|--name) name="${2:-}"; shift 2 ;;
+      -*) die "unknown option '$1' (see: sites help new)" ;;
+      *) [[ -z "$arg" ]] || die "too many arguments"; arg="$1"; shift ;;
+    esac
+  done
+  [[ -d "$TEMPLATE_DIR" ]] || die "template not found: $TEMPLATE_DIR"
+
+  # Decide the target folder: <dir> argument, -y (current dir), or ask.
+  if [[ -z "$arg" && $yes -eq 0 ]]; then
+    [[ -t 0 ]] || die "no directory given (use: sites new <dir>, or sites new -y for the current directory)"
+    read -r -p "Directory name (blank = current directory '$(basename "$PWD")'): " arg
+  fi
+  local dir
+  if [[ -z "$arg" || "$arg" == "." ]]; then dir="$PWD"; else dir="$(realpath -m "$arg")"; fi
+
+  name="${name:-$(slugify "$(basename "$dir")")}"
+  [[ -n "$name" ]] || die "can't derive a project name from '$(basename "$dir")' (use --name)"
+  valid_name "$name"
+
+  # Already a project here? Just (re-)register it.
+  if is_project_dir "$dir"; then
+    local existing; existing="$(env_get_dir "$dir" NAME)"
+    [[ -n "$existing" ]] || die "$dir has compose.yaml/.env but no NAME= in .env"
+    reg_add "$existing" "$dir"
+    ok "registered existing project '$existing' ($dir)"
+    return 0
+  fi
+  [[ ! -e "$dir/compose.yaml" && ! -e "$dir/.env" ]] || die "$dir already has a compose.yaml or .env"
+
+  local other; other="$(reg_path "$name")"
+  [[ -z "$other" ]] || die "name '$name' is already used by $other (pick another with --name)"
+
+  if [[ -n "$port" ]]; then
+    [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1024 && "$port" -le 65535 ]] || die "port must be 1024-65535"
+    port_taken "$port" && die "port $port is already used"
+  else
+    port="$(next_port)"
+  fi
+
+  # Copy template files that don't exist yet; never overwrite your files.
+  mkdir -p "$dir"
+  local src rel dst
+  while IFS= read -r -d '' src; do
+    rel="${src#"$TEMPLATE_DIR"/}"
+    dst="$dir/$rel"
+    [[ -e "$dst" ]] && continue
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+    sed -i "s/{{NAME}}/$name/g; s/{{PORT}}/$port/g" "$dst"
+  done < <(find "$TEMPLATE_DIR" -type f -print0)
+
+  reg_add "$name" "$dir"
+  ok "created $name  (port $port)"
+  echo "   folder: $dir"
+  echo "   files:  $dir/public/"
+  if compgen -G "$dir/*.html" >/dev/null; then
+    warn "found .html files in $dir — only public/ is served; move them into public/"
+  fi
+  if [[ "$dir" == "$PWD" ]]; then
+    echo "   start:  sites start        (or: sites start $name)"
+  else
+    echo "   start:  sites start $name"
+  fi
+  echo "   https:  sites tunnel $name"
+}
+
+cmd_start() {
+  resolve_project "${1:-}"
+  pc up -d web >/dev/null
+  is_running "site-$P_NAME-web" || die "web container did not start (try: sites logs $P_NAME)"
+  ok "$P_NAME is running at $(local_url)"
+}
+
+cmd_stop() {
+  if [[ "${1:-}" == "--all" || "${1:-}" == "-a" ]]; then
+    local n any=0
+    for n in $(all_projects); do
+      if is_running "site-$n-web" || is_running "site-$n-tunnel"; then cmd_stop "$n"; any=1; fi
+    done
+    [[ $any -eq 1 ]] || info "nothing running"
+    return 0
+  fi
+  resolve_project "${1:-}"
+  pc --profile tunnel down >/dev/null 2>&1 || true
+  ok "$P_NAME stopped"
+}
+
+cmd_restart() { cmd_stop "${1:-}"; cmd_start "${1:-}"; }
+
+cmd_tunnel() {
+  resolve_project "${1:-}"
+  local url="" i
+  if is_running "site-$P_NAME-tunnel"; then
+    url="$(tunnel_url)"
+    [[ -n "$url" ]] && { ok "tunnel already up: $url"; return 0; }
+  fi
+  info "starting $P_NAME + tunnel…"
+  pc --profile tunnel up -d >/dev/null
+  for ((i = 0; i < TUNNEL_WAIT; i++)); do
+    url="$(tunnel_url)"
+    [[ -n "$url" ]] && break
+    is_running "site-$P_NAME-tunnel" || break
+    sleep 1
+  done
+  if [[ -n "$url" ]]; then
+    ok "local:  $(local_url)"
+    ok "public: $url"
+    echo "${C_DIM}   anyone with this URL can view the site — run 'sites untunnel $P_NAME' when done${C_OFF}"
+  else
+    die "no tunnel URL after ${TUNNEL_WAIT}s (see: sites logs $P_NAME --tunnel)"
+  fi
+}
+
+cmd_untunnel() {
+  resolve_project "${1:-}"
+  podman rm -f --ignore "site-$P_NAME-tunnel" >/dev/null
+  ok "tunnel closed for $P_NAME (site still running locally)"
+}
+
+cmd_url() {
+  resolve_project "${1:-}"
+  if is_running "site-$P_NAME-web"; then echo "local:  $(local_url)"; else echo "local:  (stopped)"; fi
+  if is_running "site-$P_NAME-tunnel"; then echo "public: $(tunnel_url)"; else echo "public: (no tunnel)"; fi
+}
+
+cmd_open() {
+  local name="" public=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --public) public=1 ;;
+      -*) die "unknown option '$1'" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  resolve_project "$name"
+  local url=""
+  [[ $public -eq 1 ]] && url="$(tunnel_url)"
+  if [[ -z "$url" ]]; then
+    is_running "site-$P_NAME-web" || cmd_start "$P_NAME" >/dev/null
+    url="$(local_url)"
+  fi
+  xdg-open "$url" >/dev/null 2>&1 & disown
+  ok "opened $url"
+}
+
+cmd_status() {
+  local filter=""
+  if is_name_arg "${1:-}"; then resolve_project "$1"; filter="$P_NAME"; fi
+  local rows; rows="$(reg_list)"
+  [[ -n "$rows" ]] || { info "no projects yet — create one: sites new <dir>"; return 0; }
+  printf "%-18s %-6s %-9s %-34s %s\n" "PROJECT" "PORT" "WEB" "TUNNEL" "PATH"
+  local n path web tun
+  while IFS=$'\t' read -r n path; do
+    [[ -n "$filter" && "$n" != "$filter" ]] && continue
+    P_NAME="$n"; P_DIR="$path"
+    if is_running "site-$n-web"; then web="${C_GRN}running${C_OFF}"; else web="${C_DIM}stopped${C_OFF}"; fi
+    if is_running "site-$n-tunnel"; then tun="$(tunnel_url)"; tun="${tun:-starting…}"; else tun="-"; fi
+    printf "%-18s %-6s %-9s %-34s %s\n" "$n" "$(env_get PORT)" "$web" "$tun" "${path/#$HOME/\~}"
+  done <<< "$rows"
+}
+
+cmd_logs() {
+  local name="" svc="web" follow=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--tunnel) svc="tunnel" ;;
+      -f|--follow) follow=(-f) ;;
+      -*) die "unknown option '$1'" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  resolve_project "$name"
+  podman container exists "site-$P_NAME-$svc" 2>/dev/null \
+    || die "$P_NAME has no $svc container (not started$([[ $svc == tunnel ]] && echo "; run: sites tunnel $P_NAME"))"
+  podman logs "${follow[@]}" "site-$P_NAME-$svc"
+}
+
+# ---------- mounts ----------
+# .mounts format, one per line:  kind<TAB>source<TAB>container-target<TAB>mode
+#   kind: bind (host file/dir, absolute path) | volume (named podman volume)
+
+selinux_opt() { # relabel bind mounts only where SELinux is actually on
+  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then echo ",z"; fi
+}
+
+write_mounts_compose() {
+  local mf="$P_DIR/$MOUNTS_FILE" out="$P_DIR/$MOUNTS_COMPOSE"
+  if [[ ! -s "$mf" ]]; then rm -f "$mf" "$out"; return 0; fi
+  local sel kind src tgt mode vols=() v
+  sel="$(selinux_opt)"
+  {
+    echo "# Generated by 'sites mount' from $MOUNTS_FILE — don't edit; use sites mount/unmount."
+    echo "services:"
+    echo "  web:"
+    echo "    volumes:"
+    while IFS=$'\t' read -r kind src tgt mode; do
+      [[ -n "$kind" ]] || continue
+      if [[ "$kind" == bind ]]; then
+        echo "      - \"$src:$tgt:$mode$sel\""
+      else
+        echo "      - \"$src:$tgt:$mode\""
+        vols+=("$src")
+      fi
+    done < "$mf"
+    if ((${#vols[@]})); then
+      echo "volumes:"
+      for v in $(printf '%s\n' "${vols[@]}" | sort -u); do
+        echo "  $v:"
+        echo "    external: true"
+      done
+    fi
+  } > "$out"
+}
+
+# Recreate the web container so mount changes take effect (tunnel keeps running).
+apply_mounts() {
+  if is_running "site-$P_NAME-web"; then
+    info "applying: recreating $P_NAME web container…"
+    podman rm -f --ignore "site-$P_NAME-web" >/dev/null
+    pc up -d web >/dev/null
+    is_running "site-$P_NAME-web" || die "web container did not start (try: sites logs $P_NAME)"
+    ok "applied"
+  else
+    info "takes effect on next: sites start $P_NAME"
+  fi
+}
+
+# The host path inside public/ that sits under a webroot target (for placeholders).
+placeholder_for() { # placeholder_for <container-target>
+  [[ "$1" == "$WEBROOT/"* ]] && echo "$P_DIR/public/${1#"$WEBROOT"/}"
+  return 0
+}
+
+mount_display() { # container target -> what to show the user
+  if [[ "$1" == "$WEBROOT/"* ]]; then echo "/${1#"$WEBROOT"/}"; else echo "$1 (container)"; fi
+}
+
+cmd_mount() {
+  local pos=() rw=0 raw=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rw) rw=1 ;;
+      --raw) raw=1 ;;
+      -*) die "unknown option '$1' (see: sites help mount)" ;;
+      *) pos+=("$1") ;;
+    esac
+    shift
+  done
+  local proj="" spec=""
+  case ${#pos[@]} in
+    1) spec="${pos[0]}" ;;
+    2) proj="${pos[0]}"; spec="${pos[1]}" ;;
+    *) die "usage: sites mount [name|path] <source>[:<url-path>][:ro|rw]  (see: sites help mount)" ;;
+  esac
+  resolve_project "$proj"
+
+  local src tgt m extra
+  IFS=: read -r src tgt m extra <<< "$spec"
+  [[ -z "$extra" ]] || die "too many ':' in '$spec' (paths with ':' aren't supported)"
+  case "$m" in ""|ro) ;; rw) rw=1 ;; *) die "mode must be ro or rw, got '$m'" ;; esac
+  [[ -n "$src" ]] || die "missing source"
+
+  # Source: host path (anything path-like) or a named volume (bare word).
+  local kind
+  if looks_like_path "$src"; then
+    kind=bind
+    [[ "$src" == "~"* ]] && src="$HOME${src:1}"
+    [[ -e "$src" ]] || die "no such file or directory: $src"
+    src="$(realpath "$src")"
+    [[ "$src" != "/" && "$src" != "$HOME" ]] || die "refusing to mount '$src' — pick a more specific folder"
+  elif [[ "$src" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+    kind=volume
+  else
+    die "source '$src' is neither a path (use ./dir, ~/dir, /dir) nor a volume name"
+  fi
+  [[ "$src" != *[\"\\$'\t\n']* ]] || die "source path contains unsupported characters"
+
+  # Target: URL path under the site (default), or a raw container path with --raw.
+  local ctgt
+  if [[ $raw -eq 1 ]]; then
+    [[ "$tgt" == /* ]] || die "--raw needs an absolute container path, e.g. ./nginx.conf:/etc/nginx/conf.d/default.conf"
+    ctgt="${tgt%/}"
+  else
+    [[ -n "$tgt" ]] || tgt="/$(basename "$src")"
+    [[ "$tgt" == /* ]] || tgt="/$tgt"
+    tgt="${tgt%/}"
+    [[ -n "$tgt" ]] || die "can't mount over the site root '/' — put files in public/ instead"
+    [[ "$tgt" =~ ^(/[A-Za-z0-9._~-]+)+$ ]] || die "invalid url path '$tgt' (letters, digits, . _ ~ - and /)"
+    [[ "/$tgt/" != *"/../"* && "/$tgt/" != *"/./"* ]] || die "url path can't contain . or .. segments"
+    ctgt="$WEBROOT$tgt"
+  fi
+
+  local mode="ro"; [[ $rw -eq 1 ]] && mode="rw"
+
+  if [[ "$kind" == volume ]]; then
+    podman volume exists "$src" 2>/dev/null || { podman volume create "$src" >/dev/null; info "created volume '$src'"; }
+  fi
+
+  # Placeholder in public/ so the mountpoint exists inside the read-only webroot.
+  local ph; ph="$(placeholder_for "$ctgt")"
+  if [[ -n "$ph" ]]; then
+    if [[ "$kind" == bind && -f "$src" ]]; then
+      [[ ! -d "$ph" ]] || die "public/${ph#"$P_DIR"/public/} is a folder, but the source is a file"
+      [[ ! -s "$ph" ]] || warn "public/${ph#"$P_DIR"/public/} exists and will be hidden by the mount"
+      mkdir -p "$(dirname "$ph")"; [[ -e "$ph" ]] || : > "$ph"
+    else
+      [[ ! -f "$ph" ]] || die "public/${ph#"$P_DIR"/public/} is a file, but the source is a folder"
+      [[ -d "$ph" && -n "$(ls -A "$ph")" ]] && warn "public/${ph#"$P_DIR"/public/} has files that will be hidden by the mount"
+      mkdir -p "$ph"
+    fi
+  fi
+
+  # Save (replacing any mount at the same target).
+  local mf="$P_DIR/$MOUNTS_FILE" tmp; tmp="$(mktemp)"
+  [[ -f "$mf" ]] && awk -F'\t' -v t="$ctgt" '$3 != t' "$mf" > "$tmp"
+  printf '%s\t%s\t%s\t%s\n' "$kind" "$src" "$ctgt" "$mode" >> "$tmp"
+  mv "$tmp" "$mf"
+  write_mounts_compose
+
+  local shown="${src/#$HOME/\~}"; [[ "$kind" == volume ]] && shown="volume:$src"
+  ok "mounted $shown → $(mount_display "$ctgt") ($mode)"
+  [[ -n "$ph" ]] && echo "   url: $(local_url)$(mount_display "$ctgt")/"
+  apply_mounts
+}
+
+cmd_unmount() {
+  local proj="" what=""
+  case $# in
+    1) what="$1" ;;
+    2) proj="$1"; what="$2" ;;
+    *) die "usage: sites unmount [name|path] <url-path|source>" ;;
+  esac
+  resolve_project "$proj"
+  local mf="$P_DIR/$MOUNTS_FILE"
+  [[ -s "$mf" ]] || die "$P_NAME has no mounts"
+
+  local w="${what%/}" wsrc="$what"
+  [[ "$wsrc" == "~"* ]] && wsrc="$HOME${wsrc:1}"
+  wsrc="$(realpath -m "$wsrc" 2>/dev/null || echo "$wsrc")"
+
+  local kind src tgt mode keep="" removed=()
+  while IFS=$'\t' read -r kind src tgt mode; do
+    [[ -n "$kind" ]] || continue
+    if [[ "$tgt" == "$WEBROOT$w" || "$tgt" == "$w" || "$src" == "$wsrc" || "$src" == "$what" ]]; then
+      removed+=("$tgt")
+      ok "unmounted $(mount_display "$tgt")"
+    else
+      keep+="$kind"$'\t'"$src"$'\t'"$tgt"$'\t'"$mode"$'\n'
+    fi
+  done < "$mf"
+  ((${#removed[@]})) || die "no mount matches '$what' (see: sites mounts $P_NAME)"
+  printf '%s' "$keep" > "$mf"
+
+  # Remove empty placeholders we left in public/.
+  local t ph
+  for t in "${removed[@]}"; do
+    ph="$(placeholder_for "$t")"
+    [[ -n "$ph" ]] || continue
+    if [[ -d "$ph" ]]; then rmdir "$ph" 2>/dev/null || true
+    elif [[ -f "$ph" && ! -s "$ph" ]]; then rm -f "$ph"; fi
+  done
+  write_mounts_compose
+  apply_mounts
+}
+
+cmd_mounts() {
+  resolve_project "${1:-}"
+  local mf="$P_DIR/$MOUNTS_FILE"
+  [[ -s "$mf" ]] || { info "$P_NAME has no extra mounts (add one: sites mount <dir>:/path)"; return 0; }
+  printf "%-28s %-4s %s\n" "MOUNTED AT" "MODE" "SOURCE"
+  local kind src tgt mode shown
+  while IFS=$'\t' read -r kind src tgt mode; do
+    [[ -n "$kind" ]] || continue
+    if [[ "$kind" == volume ]]; then shown="volume:$src"; else shown="${src/#$HOME/\~}"; fi
+    printf "%-28s %-4s %s\n" "$(mount_display "$tgt")" "$mode" "$shown"
+  done < "$mf"
+}
+
+# ---------- help ----------
+help_topic() {
+  case "$1" in
+    new|create) cat <<EOF
+usage: sites new [dir] [-y] [--name NAME] [--port N]
+
+Create a project from the template ($TEMPLATE_DIR).
+
+  sites new blog        create ./blog/ in the current directory
+  sites new -y          turn the current directory into a project
+  sites new             ask for a directory name (blank = current directory)
+
+  -y, --yes       use the current directory, don't ask
+  -n, --name N    project name (default: the folder name, lowercased)
+  -p, --port N    host port, 1024-65535 (default: first free from $BASE_PORT)
+
+Adds compose.yaml, .env and public/index.html. Existing files are never
+overwritten. Put your site files in public/.
+
+Run it in a folder that's already a project to re-register it (e.g. after moving it).
+EOF
+;;
+    start|up) cat <<EOF
+usage: sites start [name|path]
+
+Serve the project's public/ folder with nginx at http://<BIND>:<PORT> (from .env).
+Files are mounted live — edit and refresh, no restart needed.
+
+  sites start             the project folder you're in
+  sites start .           same, explicitly
+  sites start ./blog      a project by path (also ../x, ~/x, /abs/path)
+  sites start blog        a project by name (works from anywhere)
+EOF
+;;
+    stop|down) cat <<EOF
+usage: sites stop [name|path]
+       sites stop --all
+
+Stop and remove the site's web and tunnel containers. Your files are never touched.
+
+  -a, --all     stop every project that has something running
+
+[name|path] works like 'sites start': nothing = current project folder.
+EOF
+;;
+    restart) cat <<EOF
+usage: sites restart [name|path]
+
+Stop, then start the site. Use it after you edit .env or compose.yaml.
+Note: a running tunnel is stopped too; run 'sites tunnel' again (new URL).
+EOF
+;;
+    tunnel) cat <<EOF
+usage: sites tunnel [name|path]
+
+Start the site (if needed) plus a Cloudflare quick tunnel, and print a public
+https://….trycloudflare.com URL. No account needed.
+
+  - the URL changes every time the tunnel starts
+  - anyone with the URL can view public/ until you run 'sites untunnel'
+  - waits up to \$SITES_TUNNEL_WAIT seconds (now: $TUNNEL_WAIT) for the URL
+EOF
+;;
+    untunnel) cat <<EOF
+usage: sites untunnel [name|path]
+
+Close the public tunnel. The local site keeps running.
+EOF
+;;
+    url) cat <<EOF
+usage: sites url [name|path]
+
+Print the local URL and the public tunnel URL, if there is one.
+EOF
+;;
+    open) cat <<EOF
+usage: sites open [name|path] [--public]
+
+Open the site in your default browser, starting it first if needed.
+
+  --public      open the tunnel URL instead of the local one (if a tunnel is up)
+EOF
+;;
+    status|ls|list) cat <<EOF
+usage: sites status [name|path]
+aliases: ls, list
+
+List every project with its port, web state, tunnel URL and folder.
+EOF
+;;
+    logs) cat <<EOF
+usage: sites logs [name|path] [-t] [-f]
+
+Show container logs for a project.
+
+  -t, --tunnel  show cloudflared (tunnel) logs instead of nginx logs
+  -f, --follow  keep streaming new log lines (Ctrl+C to stop)
+EOF
+;;
+    mount) cat <<EOF
+usage: sites mount [name|path] <source>[:<url-path>][:ro|rw] [--rw] [--raw]
+
+Link a host folder/file, or a named Podman volume, into the site.
+
+  source     a host path (./dir, ../x, ~/dir, /abs/dir, ./file.txt)
+             or a volume name (a bare word, e.g. uploads) — created if missing
+  url-path   where it appears on the site (default: /<source basename>)
+  ro|rw      read-only (default) or read-write; --rw does the same
+  --raw      treat the target as a container path instead of a URL path
+
+examples:
+  sites mount ~/Pictures:/photos            → http://…/photos/
+  sites mount ../shared-assets              → http://…/shared-assets/
+  sites mount blog ~/Downloads/docs:/docs   (for project 'blog', from anywhere)
+  sites mount uploads:/uploads:rw           (named volume)
+  sites mount ./nginx.conf:/etc/nginx/conf.d/default.conf --raw
+
+Edits in the host folder show up live. If the site is running, the web
+container is recreated right away (a running tunnel keeps its URL).
+Mounting again at the same url-path replaces the old mount.
+EOF
+;;
+    unmount|umount) cat <<EOF
+usage: sites unmount [name|path] <url-path|source>
+
+Remove a mount, matched by where it's mounted (/photos) or by its source
+(~/Pictures, or the volume name). Host files and volume data are never deleted.
+EOF
+;;
+    mounts) cat <<EOF
+usage: sites mounts [name|path]
+
+List a project's extra mounts.
+EOF
+;;
+    help) cat <<EOF
+usage: sites help [command]
+
+Show the overview, or detailed help for one command.
+Also works as: sites <command> --help
+EOF
+;;
+    *) die "no help for '$1' (see: sites help)" ;;
+  esac
+}
+
+cmd_help() {
+  if [[ -n "${1:-}" ]]; then help_topic "$1"; return; fi
+  cat <<EOF
+sites $VERSION — local static sites on Podman, with on-demand HTTPS tunnels
+
+usage: sites <command> [args]
+
+  new [dir] [-y]              create a project in ./dir, or the current dir (-y), or ask
+  start [proj]                serve the project's public/ folder locally
+  stop [proj] | --all         stop the site and its tunnel
+  restart [proj]              stop + start
+  tunnel [proj]               start site (if needed) + HTTPS tunnel, print public URL
+  untunnel [proj]             close the tunnel, keep the local site running
+  url [proj]                  show local and public URLs
+  open [proj] [--public]      open the site in your browser
+  status [proj]               list projects and what is running   (alias: ls)
+  logs [proj] [-t] [-f]       show web logs (-t tunnel logs, -f follow)
+  mount [proj] <src>[:/url]   link a host folder/file or volume into the site
+  unmount [proj] <url|src>    remove a mount
+  mounts [proj]               list mounts
+  help [command]              this help, or details for one command
+
+[proj] is a project name (blog), a path (., ./blog, ~/x/blog), or nothing
+for the project folder you're in.
+run 'sites help <command>' or 'sites <command> --help' for details.
+
+template:  $TEMPLATE_DIR
+registry:  $REGISTRY
+docs:      $SITES_HOME/README.md, $SITES_HOME/docs/
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  # sites <command> --help / -h
+  if [[ "$cmd" != help && " $* " =~ \ (-h|--help)\  ]]; then
+    help_topic "$cmd"; return
+  fi
+  case "$cmd" in
+    new|create|init)   cmd_new "$@" ;;
+    start|up)          cmd_start "$@" ;;
+    stop|down)         cmd_stop "$@" ;;
+    restart)           cmd_restart "$@" ;;
+    tunnel)            cmd_tunnel "$@" ;;
+    untunnel)          cmd_untunnel "$@" ;;
+    url)               cmd_url "$@" ;;
+    open)              cmd_open "$@" ;;
+    status|ls|list)    cmd_status "$@" ;;
+    logs)              cmd_logs "$@" ;;
+    mount)             cmd_mount "$@" ;;
+    unmount|umount)    cmd_unmount "$@" ;;
+    mounts)            cmd_mounts "$@" ;;
+    help|-h|--help)    cmd_help "$@" ;;
+    version|--version) echo "sites $VERSION" ;;
+    *) die "unknown command '$cmd' (see: sites help)" ;;
+  esac
+}
+
+main "$@"

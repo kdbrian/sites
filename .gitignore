@@ -1,0 +1,9 @@
+# Only track the tool itself; your own site projects in this folder stay local.
+/*
+!/.gitignore
+!/.github/
+!/sites
+!/README.md
+!/docs/
+!/_template/
+!/tests/
